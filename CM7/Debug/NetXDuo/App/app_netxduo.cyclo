@@ -1,0 +1,4 @@
+../NetXDuo/App/app_netxduo.c:52:6:MX_NetXDuo_Init	12
+../NetXDuo/App/app_netxduo.c:150:13:nx_app_thread_entry	5
+../NetXDuo/App/app_netxduo.c:199:13:tcp_server_init	3
+../NetXDuo/App/app_netxduo.c:235:13:tcp_server_run	5
