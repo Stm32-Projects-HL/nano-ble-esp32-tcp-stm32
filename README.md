@@ -180,6 +180,12 @@ STM32 handles this by **fixed-size stream reassembly** (accumulate bytes until `
 └── README.md
 ```
 
+## Output Demo
+```
+
+https://github.com/user-attachments/assets/60d22eed-9715-448f-8af2-9d01461f9b14
+
+```
 ---
 
 ## Future Improvements
@@ -189,5 +195,6 @@ STM32 handles this by **fixed-size stream reassembly** (accumulate bytes until `
 - Binary framing header (sync + versioning)
 
 ---
+
 
 
