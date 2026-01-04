@@ -11,6 +11,10 @@
 
 /* USER CODE BEGIN Includes */
 #include "main.h"
+
+#include <string.h>  //memcpy
+#include <stdint.h>
+
 /* USER CODE END Includes */
 
 /* USER CODE BEGIN PD */
@@ -26,6 +30,22 @@
          ((addr) >>  8) & 0xFF, \
          ((addr)      ) & 0xFF); \
 } while(0)
+
+
+/* IMU packets configuration and define */
+typedef struct __attribute__((packed))
+{
+  int16_t ax_mg;
+  int16_t ay_mg;
+  int16_t az_mg;
+  int16_t gx_cdeg_s;
+  int16_t gy_cdeg_s;
+  int16_t gz_cdeg_s;
+} imu_raw12_t;
+
+#define IMU_PKT_SIZE ((UINT)sizeof(imu_raw12_t))   // 12
+
+
 /* USER CODE END PD */
 
 /* Private variables ---------------------------------------------------------*/
@@ -47,6 +67,48 @@ static VOID nx_app_thread_entry(ULONG thread_input);
 /* USER CODE BEGIN PFP */
 static UINT tcp_server_init(NX_IP *ip, NX_TCP_SOCKET *sock);
 static VOID tcp_server_run(NX_IP *ip, NX_TCP_SOCKET *sock);
+
+static VOID handle_imu_packet(const imu_raw12_t *p)
+{
+  float ax = (float)p->ax_mg / 1000.0f;
+  float ay = (float)p->ay_mg / 1000.0f;
+  float az = (float)p->az_mg / 1000.0f;
+
+  float gx = (float)p->gx_cdeg_s / 100.0f;
+  float gy = (float)p->gy_cdeg_s / 100.0f;
+  float gz = (float)p->gz_cdeg_s / 100.0f;
+
+  printf("ACC[g]=%.3f %.3f %.3f | GYR[dps]=%.2f %.2f %.2f\r\n",
+         ax, ay, az, gx, gy, gz);
+}
+
+
+/* TCP stream reassembly for fixed-size IMU packets */
+static VOID imu_stream_consume(const uint8_t *data, UINT len)
+{
+  static uint8_t buf[IMU_PKT_SIZE];
+  static UINT fill = 0;
+
+  while (len > 0U)
+  {
+    UINT n = IMU_PKT_SIZE - fill;
+    if (n > len) n = len;
+
+    memcpy(&buf[fill], data, n);
+    fill += n;
+    data += n;
+    len  -= n;
+
+    if (fill == IMU_PKT_SIZE)
+    {
+      imu_raw12_t pkt;
+      memcpy(&pkt, buf, IMU_PKT_SIZE);
+      handle_imu_packet(&pkt);
+      fill = 0;
+    }
+  }
+}
+
 /* USER CODE END PFP */
 
 UINT MX_NetXDuo_Init(VOID *memory_ptr)
@@ -232,10 +294,76 @@ static UINT tcp_server_init(NX_IP *ip, NX_TCP_SOCKET *sock)
   return NX_SUCCESS;
 }
 
+//static VOID tcp_server_run(NX_IP *ip, NX_TCP_SOCKET *sock)
+//{
+//  UINT   ret;
+//  ULONG  bytes_read;
+//  UCHAR  data_buffer[512];
+//  NX_PACKET *pkt;
+//
+//  for (;;)
+//  {
+//    /* ACCEPT */
+//    ret = nx_tcp_server_socket_accept(sock, NX_WAIT_FOREVER);
+//    if (ret != NX_SUCCESS)
+//    {
+//      printf("nx_tcp_server_socket_accept failed: 0x%02X\r\n", (unsigned int)ret);
+//
+//      /* Recover: make sure we're listening again */
+//      nx_tcp_server_socket_relisten(ip, TCP_SERVER_PORT, sock);
+//      continue;
+//    }
+//
+//    printf("Client connected\r\n");
+//
+//    /* RECEIVE LOOP (one-way: receive + UART print). If you want echo, add send back. */
+//    for (;;)
+//    {
+//      ret = nx_tcp_socket_receive(sock, &pkt, NX_IP_PERIODIC_RATE); /* 1s timeout */
+//      if (ret == NX_SUCCESS)
+//      {
+//        TX_MEMSET(data_buffer, 0, sizeof(data_buffer));
+//
+//        nx_packet_data_retrieve(pkt, data_buffer, &bytes_read);
+//
+//        if (bytes_read > 0U)
+//        {
+//          HAL_UART_Transmit(&huart3, (uint8_t*)data_buffer, (uint16_t)bytes_read, 0xFFFF);
+//        }
+//
+//        nx_packet_release(pkt);
+//      }
+//      else if (ret == NX_NO_PACKET)
+//      {
+//        /* timeout: keep waiting */
+//        continue;
+//      }
+//      else
+//      {
+//        /* NX_NOT_CONNECTED / NX_CONNECTION_RESET / other errors */
+//        printf("Client disconnected or receive error: 0x%02X\r\n", (unsigned int)ret);
+//        break;
+//      }
+//    }
+//
+//    /* CLEANUP (ST-style) */
+//    nx_tcp_socket_disconnect(sock, TCP_RECONNECT_TIMEOUT_TICKS);
+//    nx_tcp_server_socket_unaccept(sock);
+//
+//    /* Re-listen without dropping the port */
+//    nx_tcp_server_socket_relisten(ip, TCP_SERVER_PORT, sock);
+//
+//    printf("Waiting for new client...\r\n");
+//  }
+//}
+
+/////////////////////////////////////////////////////////////
+///////  CHANGE RECEIVE LOOP TO RECEIVE IMU DATA  ///////////
+/////////////////////////////////////////////////////////////
+
 static VOID tcp_server_run(NX_IP *ip, NX_TCP_SOCKET *sock)
 {
   UINT   ret;
-  ULONG  bytes_read;
   UCHAR  data_buffer[512];
   NX_PACKET *pkt;
 
@@ -246,53 +374,68 @@ static VOID tcp_server_run(NX_IP *ip, NX_TCP_SOCKET *sock)
     if (ret != NX_SUCCESS)
     {
       printf("nx_tcp_server_socket_accept failed: 0x%02X\r\n", (unsigned int)ret);
-
-      /* Recover: make sure we're listening again */
       nx_tcp_server_socket_relisten(ip, TCP_SERVER_PORT, sock);
       continue;
     }
 
     printf("Client connected\r\n");
 
-    /* RECEIVE LOOP (one-way: receive + UART print). If you want echo, add send back. */
+    /* RECEIVE LOOP */
     for (;;)
     {
       ret = nx_tcp_socket_receive(sock, &pkt, NX_IP_PERIODIC_RATE); /* 1s timeout */
+
       if (ret == NX_SUCCESS)
       {
-        TX_MEMSET(data_buffer, 0, sizeof(data_buffer));
+        ULONG pkt_len = 0;
+        ULONG offset  = 0;
 
-        nx_packet_data_retrieve(pkt, data_buffer, &bytes_read);
+        nx_packet_length_get(pkt, &pkt_len);
 
-        if (bytes_read > 0U)
+        while (offset < pkt_len)
         {
-          HAL_UART_Transmit(&huart3, (uint8_t*)data_buffer, (uint16_t)bytes_read, 0xFFFF);
+          ULONG copied = 0;
+          ULONG chunk  = pkt_len - offset;
+
+          if (chunk > sizeof(data_buffer))
+            chunk = sizeof(data_buffer);
+
+          UINT r2 = nx_packet_data_extract_offset(pkt,
+                                                 offset,
+                                                 data_buffer,
+                                                 (UINT)chunk,
+                                                 &copied);
+          if (r2 != NX_SUCCESS)
+          {
+            printf("nx_packet_data_extract_offset error: 0x%02X\r\n", (unsigned int)r2);
+            break;
+          }
+
+          imu_stream_consume((const uint8_t*)data_buffer, (UINT)copied);
+          offset += copied;
         }
 
         nx_packet_release(pkt);
       }
       else if (ret == NX_NO_PACKET)
       {
-        /* timeout: keep waiting */
         continue;
       }
       else
       {
-        /* NX_NOT_CONNECTED / NX_CONNECTION_RESET / other errors */
         printf("Client disconnected or receive error: 0x%02X\r\n", (unsigned int)ret);
-        break;
+        break; /* break RECEIVE LOOP -> go to cleanup */
       }
     }
 
-    /* CLEANUP (ST-style) */
+    /* CLEANUP (runs once per disconnect/error) */
     nx_tcp_socket_disconnect(sock, TCP_RECONNECT_TIMEOUT_TICKS);
     nx_tcp_server_socket_unaccept(sock);
-
-    /* Re-listen without dropping the port */
     nx_tcp_server_socket_relisten(ip, TCP_SERVER_PORT, sock);
 
     printf("Waiting for new client...\r\n");
   }
 }
+
 
 /* USER CODE END 1 */
