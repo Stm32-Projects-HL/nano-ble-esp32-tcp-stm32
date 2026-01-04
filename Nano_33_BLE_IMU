@@ -1,0 +1,91 @@
+#include <ArduinoBLE.h>
+#include <Arduino_BMI270_BMM150.h>
+
+// 128-bit custom UUIDs (simple + clean)
+BLEService imuService("12345678-1234-5678-1234-56789abcdef0");
+BLECharacteristic imuChar(
+  "12345678-1234-5678-1234-56789abcdef1",
+  BLERead | BLENotify,
+  12
+);
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  // --- IMU INIT ---
+  if (!IMU.begin()) {
+    Serial.println("IMU FAILED");
+    while (1);
+  }
+  Serial.println("IMU READY");
+
+  // --- BLE INIT ---
+  if (!BLE.begin()) {
+    Serial.println("BLE FAILED");
+    while (1);
+  }
+
+  BLE.setLocalName("IMU-NANO");
+  BLE.setDeviceName("IMU-NANO");
+
+  BLE.setAdvertisedService(imuService);
+  imuService.addCharacteristic(imuChar);
+  BLE.addService(imuService);
+
+  // Initial dummy packet (required by BLE)
+  uint8_t zeroPacket[12] = {0};
+  imuChar.writeValue(zeroPacket, 12);
+
+  BLE.advertise();
+  Serial.println("Advertising IMU-NANO...");
+}
+
+void loop() {
+  BLEDevice central = BLE.central();
+  if (!central) return;
+
+  Serial.print("Connected to: ");
+  Serial.println(central.address());
+
+  float ax, ay, az;
+  float gx, gy, gz;
+
+  while (central.connected()) {
+
+    if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable()) {
+      IMU.readAcceleration(ax, ay, az);
+      IMU.readGyroscope(gx, gy, gz);
+
+      int16_t ax_i = ax * 1000;
+      int16_t ay_i = ay * 1000;
+      int16_t az_i = az * 1000;
+
+      int16_t gx_i = gx * 100;
+      int16_t gy_i = gy * 100;
+      int16_t gz_i = gz * 100;
+
+      uint8_t packet[12];
+      memcpy(packet,     &ax_i, 2);
+      memcpy(packet + 2, &ay_i, 2);
+      memcpy(packet + 4, &az_i, 2);
+      memcpy(packet + 6, &gx_i, 2);
+      memcpy(packet + 8, &gy_i, 2);
+      memcpy(packet +10, &gz_i, 2);
+
+      imuChar.writeValue(packet, 12);
+
+      // Debug print
+      Serial.print("AX "); Serial.print(ax_i);
+      Serial.print(" AY "); Serial.print(ay_i);
+      Serial.print(" AZ "); Serial.print(az_i);
+      Serial.print(" | GX "); Serial.print(gx_i);
+      Serial.print(" GY "); Serial.print(gy_i);
+      Serial.print(" GZ "); Serial.println(gz_i);
+
+      delay(20);
+    }
+  }
+
+  Serial.println("Disconnected.");
+}
