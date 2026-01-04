@@ -1,0 +1,235 @@
+#include <WiFi.h>
+#include "BLEDevice.h"
+
+/* ================= WIFI CONFIG ================= */
+static const char* WIFI_SSID     = "Your_WIFI_SSID";
+static const char* WIFI_PASSWORD = "Your_WIFI_Password";
+
+static const IPAddress STM32_IP(192, 168, 1, 111);
+static const uint16_t  STM32_PORT = 6000;
+/* =============================================== */
+
+/* =============== BLE UUIDs (Nano) ============== */
+static BLEUUID serviceUUID("12345678-1234-5678-1234-56789abcdef0");      // You can change this
+static BLEUUID charUUID   ("12345678-1234-5678-1234-56789abcdef1");      // You can change this
+/* =============================================== */
+
+static constexpr size_t IMU_RAW_LEN = 12;     // EXACT Nano encoded payload length
+static constexpr size_t QUEUE_DEPTH = 32;     // buffer up to 32 packets
+
+/* Raw packet container */
+typedef struct __attribute__((packed)) {
+  uint8_t bytes[IMU_RAW_LEN];
+} imu_raw_pkt_t;
+
+/* Globals */
+static WiFiClient tcp;
+static QueueHandle_t imuQueue = nullptr;
+
+static BLERemoteCharacteristic* pChar = nullptr;
+static BLEAdvertisedDevice*     foundDevice = nullptr;
+static BLEClient*               bleClient = nullptr;
+
+static volatile bool doConnect = false;
+static volatile bool bleReady  = false;
+
+/* ---------- Helpers: WiFi/TCP ---------- */
+
+static void wifiEnsureConnected()
+{
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.println("WiFi: connecting...");
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);          // helps coexistence (less latency)
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  const uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+    if (millis() - start > 60000)
+    {
+      Serial.println("\nWiFi: TIMEOUT");
+      return;
+    }
+  }
+
+  Serial.println("\nWiFi: CONNECTED");
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+static bool tcpEnsureConnected()
+{
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (tcp.connected()) return true;
+
+  tcp.stop();
+  Serial.print("TCP: connecting to STM32 ");
+  Serial.print(STM32_IP);
+  Serial.print(":");
+  Serial.println(STM32_PORT);
+
+  if (!tcp.connect(STM32_IP, STM32_PORT))
+  {
+    Serial.println("TCP: connect FAILED");
+    return false;
+  }
+
+  tcp.setNoDelay(true);
+  Serial.println("TCP: connected");
+  return true;
+}
+
+/* ---------- BLE Notify Callback ---------- */
+/* Keep this FAST: just enqueue the raw 12 bytes. */
+static void notifyCallback(BLERemoteCharacteristic* chr,
+                           uint8_t* data, size_t len, bool notify)
+{
+  (void)chr; (void)notify;
+
+  if (len != IMU_RAW_LEN) return;
+
+  imu_raw_pkt_t pkt;
+  memcpy(pkt.bytes, data, IMU_RAW_LEN);
+
+  /* Non-blocking queue send; if full, drop newest packet silently */
+  if (imuQueue)
+  {
+    (void)xQueueSend(imuQueue, &pkt, 0);
+  }
+}
+
+/* ---------- BLE Scan Callback ---------- */
+class AdvertisedCB : public BLEAdvertisedDeviceCallbacks
+{
+  void onResult(BLEAdvertisedDevice dev) override
+  {
+    if (dev.haveServiceUUID() && dev.isAdvertisingService(serviceUUID))
+    {
+      Serial.println("BLE: Found IMU-NANO, stopping scan");
+      BLEDevice::getScan()->stop();
+
+      if (foundDevice) { delete foundDevice; foundDevice = nullptr; }
+      foundDevice = new BLEAdvertisedDevice(dev);
+
+      doConnect = true;
+    }
+  }
+};
+
+static bool connectToNano()
+{
+  if (!foundDevice) return false;
+
+  Serial.println("BLE: Connecting to IMU-NANO...");
+
+  if (!bleClient)
+    bleClient = BLEDevice::createClient();
+
+  if (!bleClient->connect(foundDevice))
+  {
+    Serial.println("BLE: connect FAILED");
+    return false;
+  }
+
+  BLERemoteService* service = bleClient->getService(serviceUUID);
+  if (!service)
+  {
+    Serial.println("BLE: Service NOT found");
+    bleClient->disconnect();
+    return false;
+  }
+
+  pChar = service->getCharacteristic(charUUID);
+  if (!pChar)
+  {
+    Serial.println("BLE: Char NOT found");
+    bleClient->disconnect();
+    return false;
+  }
+
+  if (pChar->canNotify())
+  {
+    pChar->registerForNotify(notifyCallback);
+    Serial.println("BLE: Subscribed to IMU notifications");
+    bleReady = true;
+    return true;
+  }
+
+  Serial.println("BLE: Char cannot notify");
+  bleClient->disconnect();
+  return false;
+}
+
+static void startBleScan()
+{
+  Serial.println("BLE: Starting scan...");
+  BLEScan* scan = BLEDevice::getScan();
+  scan->setAdvertisedDeviceCallbacks(new AdvertisedCB());
+  scan->setActiveScan(true);
+  scan->start(0); // continuous until found
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("\n=== ESP32 BLE -> TCP Bridge (Raw 12B) ===");
+
+  imuQueue = xQueueCreate(QUEUE_DEPTH, sizeof(imu_raw_pkt_t));
+  if (!imuQueue)
+  {
+    Serial.println("ERROR: Failed to create queue");
+    for(;;) delay(1000);
+  }
+
+  wifiEnsureConnected();
+
+  BLEDevice::init("");
+  startBleScan();
+}
+
+void loop()
+{
+  /* 1) Ensure WiFi */
+  wifiEnsureConnected();
+
+  /* 2) BLE connect when device found */
+  if (doConnect)
+  {
+    doConnect = false;
+    bleReady = false;
+    (void)connectToNano();
+  }
+
+  /* 3) If BLE disconnected later, restart scan */
+  if (bleClient && bleReady && !bleClient->isConnected())
+  {
+    Serial.println("BLE: disconnected, restarting scan");
+    bleReady = false;
+    pChar = nullptr;
+    startBleScan();
+  }
+
+  /* 4) Forward queued IMU packets over TCP */
+  imu_raw_pkt_t pkt;
+  while (xQueueReceive(imuQueue, &pkt, 0) == pdTRUE)
+  {
+    if (!tcpEnsureConnected())
+      break; // try again next loop
+
+    const size_t n = tcp.write(pkt.bytes, IMU_RAW_LEN);
+    if (n != IMU_RAW_LEN)
+    {
+      Serial.println("TCP: partial/failed write, reconnecting");
+      tcp.stop();
+      break;
+    }
+  }
+
+  delay(5);
+}
